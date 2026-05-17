@@ -200,11 +200,30 @@ impl<'a> BootManifest<'a> {
         validate_image_flags(self.kernel.flags)?;
 
         for image in [self.init, self.config, self.policy] {
-            if image.path.is_some() || image.length != 0 || image.load_address != 0 {
+            if image_touched(image) {
                 if !image.is_present() || image.end().is_none() {
                     return Err(BootError::InvalidImage);
                 }
                 validate_image_flags(image.flags)?;
+            }
+        }
+
+        for (index, image) in [self.kernel, self.init, self.config, self.policy]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            if !image.is_present() {
+                continue;
+            }
+            for other in [self.kernel, self.init, self.config, self.policy]
+                .iter()
+                .copied()
+                .skip(index + 1)
+            {
+                if other.is_present() && images_overlap(image, other)? {
+                    return Err(BootError::InvalidImage);
+                }
             }
         }
 
@@ -308,4 +327,19 @@ fn validate_image_flags(flags: u32) -> BootResult<()> {
     } else {
         Err(BootError::ReservedBits)
     }
+}
+
+fn image_touched(image: ManifestImage<'_>) -> bool {
+    image.path.is_some()
+        || image.load_address != 0
+        || image.length != 0
+        || image.entry != 0
+        || image.checksum != 0
+        || image.flags != 0
+}
+
+fn images_overlap(left: ManifestImage<'_>, right: ManifestImage<'_>) -> BootResult<bool> {
+    let left_end = left.end().ok_or(BootError::InvalidImage)?;
+    let right_end = right.end().ok_or(BootError::InvalidImage)?;
+    Ok(left.load_address < right_end && right.load_address < left_end)
 }

@@ -3,9 +3,9 @@ use alani_boot::early_console::{
 };
 use alani_boot::error::{BootError, BootStatus};
 use alani_boot::handoff::{
-    BootSource, BootTarget, CpuFeatureSet, HandoffImage, HandoffImageKind, HandoffMemoryKind,
-    HandoffMemoryMap, HandoffMemoryRegion, MeasurementComponent, MeasurementRecord,
-    MemoryAttributes,
+    BootSource, BootTarget, CpuFeatureSet, HandoffBootProfile, HandoffImage, HandoffImageKind,
+    HandoffMemoryKind, HandoffMemoryMap, HandoffMemoryRegion, MeasurementComponent,
+    MeasurementRecord, MemoryAttributes, BOOT_OPTION_ALLOW_MOCKS, BOOT_OPTION_EARLY_CONSOLE,
 };
 use alani_boot::manifest::{BootManifest, BootProfile};
 use alani_boot::uefi::{
@@ -61,6 +61,15 @@ fn manifest_rejects_kernel_entry_outside_image() {
     )
     .unwrap_err();
     assert_eq!(error, BootError::MissingEntryPoint);
+}
+
+#[test]
+fn manifest_rejects_overlapping_loaded_images() {
+    let error = BootManifest::parse(
+        "kernel.path=/boot/kernel\nkernel.load_address=0x100000\nkernel.length=0x2000\nkernel.entry=0x101000\ninit.path=/boot/init\ninit.load_address=0x101000\ninit.length=0x1000\n",
+    )
+    .unwrap_err();
+    assert_eq!(error, BootError::InvalidImage);
 }
 
 #[test]
@@ -172,6 +181,23 @@ fn uefi_memory_map_rejects_overlap() {
 }
 
 #[test]
+fn uefi_attributes_reject_reserved_bits() {
+    assert_eq!(
+        UefiMemoryAttributes::from_bits(1 << 63),
+        Err(BootError::ReservedBits)
+    );
+    assert_eq!(
+        UefiMemoryDescriptor::new(
+            UefiMemoryType::Conventional,
+            0x100001,
+            1,
+            UefiMemoryAttributes::empty(),
+        ),
+        Err(BootError::InvalidUefiDescriptor)
+    );
+}
+
+#[test]
 fn exit_boot_services_plan_validates_map_key_and_descriptor_size() {
     let state = BootServicesState::active(0, core::mem::size_of::<UefiMemoryDescriptor>(), 1);
     assert_eq!(
@@ -202,6 +228,36 @@ fn handoff_builder_requires_kernel_memory_and_cpu_features() {
             .build()
             .unwrap_err();
     assert_eq!(error, BootError::MemoryMapEmpty);
+}
+
+#[test]
+fn handoff_memory_and_measurements_fail_closed() {
+    assert_eq!(
+        HandoffMemoryRegion::new(
+            0x100000,
+            0x1000,
+            HandoffMemoryKind::KernelImage,
+            MemoryAttributes::WRITE.union(MemoryAttributes::EXECUTE),
+        ),
+        Err(BootError::InvalidMemoryRegion)
+    );
+    assert_eq!(
+        HandoffMemoryRegion::new(
+            0xfec00000,
+            0x1000,
+            HandoffMemoryKind::Mmio,
+            MemoryAttributes::READ
+        ),
+        Err(BootError::InvalidMemoryRegion)
+    );
+    assert_eq!(
+        MeasurementRecord::sha256(MeasurementComponent::Kernel, [0; 32]).validate(),
+        Err(BootError::IntegrityMismatch)
+    );
+    assert_eq!(
+        CpuFeatureSet::from_bits(1 << 63),
+        Err(BootError::ReservedBits)
+    );
 }
 
 #[test]
@@ -245,6 +301,42 @@ fn build_handoff_from_manifest_produces_valid_handoff() {
     assert_eq!(handoff.kernel_image.entry, 0x101000);
     assert_eq!(handoff.init_image.kind, HandoffImageKind::Init);
     assert_eq!(handoff.measurements.len(), 1);
+    assert_eq!(
+        handoff.boot_options.profile,
+        HandoffBootProfile::Development
+    );
+    assert!(handoff.boot_options.contains(BOOT_OPTION_ALLOW_MOCKS));
+    assert!(handoff.boot_options.contains(BOOT_OPTION_EARLY_CONSOLE));
+}
+
+#[test]
+fn secure_boot_manifest_requires_measurement() {
+    let manifest = BootManifest::parse(
+        "kernel.path=/boot/kernel\nkernel.load_address=0x100000\nkernel.length=0x200000\nkernel.entry=0x101000\nkernel.checksum=0xfeed\nsecure_boot.required=true\n",
+    )
+    .unwrap();
+    let mut map = HandoffMemoryMap::new();
+    map.push(
+        HandoffMemoryRegion::new(
+            0x100000,
+            0x200000,
+            HandoffMemoryKind::KernelImage,
+            MemoryAttributes::READ.union(MemoryAttributes::EXECUTE),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = build_handoff_from_manifest(
+        &manifest,
+        map,
+        BootTarget::HostTest,
+        BootSource::HostTest,
+        CpuFeatureSet::empty(),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(error, BootError::IntegrityMismatch);
 }
 
 #[test]

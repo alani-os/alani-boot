@@ -11,6 +11,17 @@ pub const MAX_HANDOFF_MEMORY_REGIONS: usize = 128;
 /// Maximum measurement records transferred to the kernel.
 pub const MAX_BOOT_MEASUREMENTS: usize = 16;
 
+/// Secure-boot measurements are required by the selected profile.
+pub const BOOT_OPTION_REQUIRE_SECURE_BOOT: u32 = 1 << 0;
+/// Mock devices and host-mode seams are allowed.
+pub const BOOT_OPTION_ALLOW_MOCKS: u32 = 1 << 1;
+/// Early console was requested by the manifest.
+pub const BOOT_OPTION_EARLY_CONSOLE: u32 = 1 << 2;
+
+/// All boot option bits known by this crate version.
+pub const BOOT_OPTION_KNOWN_FLAGS: u32 =
+    BOOT_OPTION_REQUIRE_SECURE_BOOT | BOOT_OPTION_ALLOW_MOCKS | BOOT_OPTION_EARLY_CONSOLE;
+
 /// Handoff magic value: ASCII-ish `ALANBOOT` in little-endian form.
 pub const HANDOFF_MAGIC: u64 = 0x544f_4f42_4e41_4c41;
 
@@ -60,6 +71,67 @@ pub enum BootSource {
     Emulator = 2,
     /// Host-mode tests.
     HostTest = 0xffff,
+}
+
+/// Boot profile transferred to the kernel.
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HandoffBootProfile {
+    /// Smallest MVK profile.
+    Minimal = 0,
+    /// Developer profile with diagnostics and mocks enabled.
+    Development = 1,
+    /// Recovery profile.
+    Recovery = 2,
+    /// Host-test profile.
+    Test = 3,
+}
+
+/// Boot option flags preserved for kernel initialization.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootOptions {
+    /// Selected boot profile.
+    pub profile: HandoffBootProfile,
+    /// Reserved alignment field.
+    pub reserved: u16,
+    /// Boot option bitset.
+    pub flags: u32,
+}
+
+impl BootOptions {
+    /// Minimal boot options.
+    pub const MINIMAL: Self = Self {
+        profile: HandoffBootProfile::Minimal,
+        reserved: 0,
+        flags: 0,
+    };
+
+    /// Creates boot options after rejecting reserved bits.
+    pub const fn new(profile: HandoffBootProfile, flags: u32) -> BootResult<Self> {
+        if flags & !BOOT_OPTION_KNOWN_FLAGS != 0 {
+            return Err(BootError::ReservedBits);
+        }
+        Ok(Self {
+            profile,
+            reserved: 0,
+            flags,
+        })
+    }
+
+    /// Returns `true` when all supplied flags are present.
+    pub const fn contains(self, flags: u32) -> bool {
+        self.flags & flags == flags
+    }
+
+    /// Validates reserved fields and flag bits.
+    pub const fn validate(self) -> BootResult<()> {
+        if self.reserved != 0 || self.flags & !BOOT_OPTION_KNOWN_FLAGS != 0 {
+            Err(BootError::ReservedBits)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Memory region kind transferred to the kernel.
@@ -140,6 +212,15 @@ impl MemoryAttributes {
         self.bits
     }
 
+    /// Validates reserved bits.
+    pub const fn validate(self) -> BootResult<()> {
+        if self.bits & !Self::known_bits() == 0 {
+            Ok(())
+        } else {
+            Err(BootError::ReservedBits)
+        }
+    }
+
     /// Returns a union of two attribute sets.
     pub const fn union(self, other: Self) -> Self {
         Self {
@@ -189,6 +270,19 @@ impl HandoffMemoryRegion {
         if length == 0 || start.checked_add(length).is_none() {
             return Err(BootError::InvalidMemoryRegion);
         }
+        match attributes.validate() {
+            Ok(()) => {}
+            Err(error) => return Err(error),
+        }
+        if attributes.contains(MemoryAttributes::WRITE)
+            && attributes.contains(MemoryAttributes::EXECUTE)
+        {
+            return Err(BootError::InvalidMemoryRegion);
+        }
+        if matches!(kind, HandoffMemoryKind::Mmio) && !attributes.contains(MemoryAttributes::DEVICE)
+        {
+            return Err(BootError::InvalidMemoryRegion);
+        }
         Ok(Self {
             start,
             length,
@@ -201,6 +295,28 @@ impl HandoffMemoryRegion {
     /// Exclusive end address.
     pub const fn end(self) -> u64 {
         self.start + self.length
+    }
+
+    /// Validates range, reserved fields, and attributes.
+    pub const fn validate(self) -> BootResult<()> {
+        if self.reserved != 0 || self.length == 0 || self.start.checked_add(self.length).is_none() {
+            return Err(BootError::InvalidMemoryRegion);
+        }
+        let attributes = match MemoryAttributes::from_bits(self.attributes) {
+            Ok(attributes) => attributes,
+            Err(error) => return Err(error),
+        };
+        if attributes.contains(MemoryAttributes::WRITE)
+            && attributes.contains(MemoryAttributes::EXECUTE)
+        {
+            return Err(BootError::InvalidMemoryRegion);
+        }
+        if matches!(self.kind, HandoffMemoryKind::Mmio)
+            && !attributes.contains(MemoryAttributes::DEVICE)
+        {
+            return Err(BootError::InvalidMemoryRegion);
+        }
+        Ok(())
     }
 
     /// Returns `true` when this region overlaps `other`.
@@ -243,6 +359,7 @@ impl HandoffMemoryMap {
 
     /// Adds a non-overlapping memory region.
     pub fn push(&mut self, region: HandoffMemoryRegion) -> BootResult<()> {
+        region.validate()?;
         if self.len() == MAX_HANDOFF_MEMORY_REGIONS {
             return Err(BootError::CapacityExceeded);
         }
@@ -261,6 +378,20 @@ impl HandoffMemoryMap {
             .filter(|entry| entry.kind == kind)
             .map(|entry| entry.length)
             .sum()
+    }
+
+    /// Validates map entries and overlap constraints.
+    pub fn validate(&self) -> BootResult<()> {
+        for (index, entry) in self.entries().iter().copied().enumerate() {
+            entry.validate()?;
+            for other in self.entries().iter().copied().skip(index + 1) {
+                other.validate()?;
+                if entry.overlaps(other) {
+                    return Err(BootError::MemoryRegionOverlap);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -366,6 +497,35 @@ impl HandoffImage {
             false
         }
     }
+
+    /// Validates image metadata.
+    pub fn validate(self, expected: HandoffImageKind, entry_required: bool) -> BootResult<()> {
+        if self.reserved != 0 || self.flags != 0 {
+            return Err(BootError::ReservedBits);
+        }
+        if expected == HandoffImageKind::None {
+            if self.kind == HandoffImageKind::None
+                && self.physical_start == 0
+                && self.virtual_start == 0
+                && self.length == 0
+                && self.entry == 0
+                && self.checksum == 0
+            {
+                return Ok(());
+            }
+            return Err(BootError::InvalidImage);
+        }
+        if self.kind != expected || !self.is_present() || self.end().is_none() {
+            return Err(BootError::InvalidImage);
+        }
+        if entry_required && !self.contains_entry() {
+            return Err(BootError::MissingEntryPoint);
+        }
+        if !entry_required && self.entry != 0 && !self.contains_entry() {
+            return Err(BootError::MissingEntryPoint);
+        }
+        Ok(())
+    }
 }
 
 /// Framebuffer format.
@@ -411,6 +571,32 @@ impl FramebufferInfo {
         format: FramebufferFormat::None,
         reserved: 0,
     };
+
+    /// Validates framebuffer metadata.
+    pub fn validate(self) -> BootResult<()> {
+        if matches!(self.format, FramebufferFormat::None) {
+            if self == Self::EMPTY {
+                return Ok(());
+            }
+            return Err(BootError::InvalidArgument);
+        }
+        if self.reserved != 0
+            || self.base == 0
+            || self.length == 0
+            || self.width == 0
+            || self.height == 0
+            || self.stride == 0
+        {
+            return Err(BootError::InvalidArgument);
+        }
+        let minimum = u64::from(self.stride)
+            .checked_mul(u64::from(self.height))
+            .ok_or(BootError::InvalidArgument)?;
+        if self.length < minimum {
+            return Err(BootError::InvalidArgument);
+        }
+        Ok(())
+    }
 }
 
 /// ACPI table pointers discovered by firmware.
@@ -424,6 +610,15 @@ pub struct AcpiInfo {
 impl AcpiInfo {
     /// Empty ACPI descriptor.
     pub const EMPTY: Self = Self { rsdp_physical: 0 };
+
+    /// Validates ACPI pointer metadata.
+    pub const fn validate(self) -> BootResult<()> {
+        if self.rsdp_physical == 0 || self.rsdp_physical & 0xf == 0 {
+            Ok(())
+        } else {
+            Err(BootError::InvalidArgument)
+        }
+    }
 }
 
 /// CPU feature bits expected by the kernel bootstrap.
@@ -432,6 +627,13 @@ impl AcpiInfo {
 pub struct CpuFeatureSet {
     bits: u64,
 }
+
+/// All CPU feature bits known by this crate version.
+pub const CPU_FEATURE_KNOWN_BITS: u64 = CpuFeatureSet::LONG_MODE.bits()
+    | CpuFeatureSet::NX.bits()
+    | CpuFeatureSet::SSE2.bits()
+    | CpuFeatureSet::APIC.bits()
+    | CpuFeatureSet::XSAVE.bits();
 
 impl CpuFeatureSet {
     /// Long mode.
@@ -461,6 +663,24 @@ impl CpuFeatureSet {
     /// Raw feature bits.
     pub const fn bits(self) -> u64 {
         self.bits
+    }
+
+    /// Creates a feature set after rejecting unknown bits.
+    pub const fn from_bits(bits: u64) -> BootResult<Self> {
+        if bits & !CPU_FEATURE_KNOWN_BITS != 0 {
+            Err(BootError::ReservedBits)
+        } else {
+            Ok(Self { bits })
+        }
+    }
+
+    /// Validates reserved bits.
+    pub const fn validate(self) -> BootResult<()> {
+        if self.bits & !CPU_FEATURE_KNOWN_BITS != 0 {
+            Err(BootError::ReservedBits)
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns a union of two feature sets.
@@ -540,6 +760,23 @@ impl MeasurementRecord {
             digest,
         }
     }
+
+    /// Validates measurement metadata.
+    pub fn validate(self) -> BootResult<()> {
+        if self.reserved != 0 {
+            return Err(BootError::ReservedBits);
+        }
+        if matches!(self.component, MeasurementComponent::None)
+            || self.algorithm != MeasurementAlgorithm::Sha256
+            || self.digest_len != 32
+        {
+            return Err(BootError::InvalidArgument);
+        }
+        if self.digest.iter().all(|byte| *byte == 0) {
+            return Err(BootError::IntegrityMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Fixed-capacity measurement set.
@@ -579,13 +816,17 @@ impl MeasurementSet {
         if self.len() == MAX_BOOT_MEASUREMENTS {
             return Err(BootError::CapacityExceeded);
         }
-        if matches!(record.component, MeasurementComponent::None)
-            || matches!(record.algorithm, MeasurementAlgorithm::None)
-        {
-            return Err(BootError::InvalidArgument);
-        }
+        record.validate()?;
         self.records[self.len()] = record;
         self.len += 1;
+        Ok(())
+    }
+
+    /// Validates all measurement records.
+    pub fn validate(&self) -> BootResult<()> {
+        for record in self.records() {
+            record.validate()?;
+        }
         Ok(())
     }
 }
@@ -610,6 +851,8 @@ pub struct BootHandoff {
     pub source: BootSource,
     /// Reserved boot flags.
     pub flags: u32,
+    /// Boot profile and policy options.
+    pub boot_options: BootOptions,
     /// Preserved memory map.
     pub memory_map: HandoffMemoryMap,
     /// Kernel image metadata.
@@ -639,6 +882,7 @@ impl BootHandoff {
             target,
             source,
             flags: 0,
+            boot_options: BootOptions::MINIMAL,
             memory_map: HandoffMemoryMap::new(),
             kernel_image: HandoffImage::EMPTY,
             init_image: HandoffImage::EMPTY,
@@ -653,18 +897,47 @@ impl BootHandoff {
 
     /// Validates handoff invariants before entering the kernel.
     pub fn validate(&self) -> BootResult<()> {
-        if self.magic != HANDOFF_MAGIC || self.version.major != HANDOFF_VERSION.major {
+        if self.magic != HANDOFF_MAGIC
+            || self.version.major != HANDOFF_VERSION.major
+            || self.version.flags != 0
+            || self.flags != 0
+        {
             return Err(BootError::HandoffIncomplete);
         }
+        self.boot_options.validate()?;
         if self.memory_map.is_empty() {
             return Err(BootError::MemoryMapEmpty);
         }
-        if self.kernel_image.kind != HandoffImageKind::Kernel || !self.kernel_image.is_present() {
-            return Err(BootError::MissingKernelImage);
-        }
-        if !self.kernel_image.contains_entry() {
-            return Err(BootError::MissingEntryPoint);
-        }
+        self.memory_map.validate()?;
+        self.kernel_image.validate(HandoffImageKind::Kernel, true)?;
+        self.init_image.validate(
+            if self.init_image.is_present() {
+                HandoffImageKind::Init
+            } else {
+                HandoffImageKind::None
+            },
+            false,
+        )?;
+        self.config_blob.validate(
+            if self.config_blob.is_present() {
+                HandoffImageKind::Config
+            } else {
+                HandoffImageKind::None
+            },
+            false,
+        )?;
+        self.policy_bundle.validate(
+            if self.policy_bundle.is_present() {
+                HandoffImageKind::Policy
+            } else {
+                HandoffImageKind::None
+            },
+            false,
+        )?;
+        self.framebuffer.validate()?;
+        self.acpi.validate()?;
+        self.cpu_features.validate()?;
+        self.measurements.validate()?;
         if matches!(self.target, BootTarget::X86_64Uefi | BootTarget::X86_64Qemu)
             && !self
                 .cpu_features
@@ -735,6 +1008,12 @@ impl BootHandoffBuilder {
     /// Sets detected CPU features.
     pub const fn cpu_features(mut self, features: CpuFeatureSet) -> Self {
         self.handoff.cpu_features = features;
+        self
+    }
+
+    /// Sets boot options.
+    pub const fn boot_options(mut self, options: BootOptions) -> Self {
+        self.handoff.boot_options = options;
         self
     }
 

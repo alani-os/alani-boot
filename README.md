@@ -4,7 +4,7 @@ UEFI and emulator boot handoff logic, kernel image metadata, boot manifest parsi
 
 | Field | Value |
 |---|---|
-| Status | Experimental MVK skeleton |
+| Status | Experimental MVK implementation surface |
 | Tier | MVK required |
 | Owner | Platform team |
 | Aliases | None |
@@ -17,7 +17,7 @@ cargo fmt -- --check
 cargo test --all-features
 cargo test --no-default-features
 cargo check --no-default-features
-cargo clippy --all-features -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 ## Scope
@@ -25,10 +25,10 @@ cargo clippy --all-features -- -D warnings
 This crate is intentionally dependency-free while sibling repository APIs stabilize. It implements no-std-friendly host-mode contracts for:
 
 - deterministic boot phase tracking from firmware entry through kernel entry;
-- borrowed `key=value` boot manifest parsing with kernel, init, config, policy, profile, console, and secure-boot intent fields;
-- UEFI memory descriptor capture, validation, overlap rejection, and translation into kernel handoff memory regions;
+- borrowed `key=value` boot manifest parsing with kernel, init, config, policy, profile, console, secure-boot intent fields, and loaded-image overlap rejection;
+- UEFI memory descriptor capture, attribute validation, overlap rejection, and translation into kernel handoff memory regions;
 - `ExitBootServices` planning metadata, including map key and descriptor-size validation;
-- ABI-shaped boot handoff data for memory maps, image metadata, framebuffer, ACPI, CPU features, and measurement records;
+- ABI-shaped boot handoff data for memory maps, image metadata, framebuffer, ACPI, CPU features, manifest-derived boot options, and measurement records;
 - early console configuration, structured event retention, and default redaction for sensitive or secret messages.
 
 ## Layout

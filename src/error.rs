@@ -39,7 +39,7 @@ pub enum BootError {
     InvalidArgument,
     /// A boot manifest line or key/value pair is malformed.
     InvalidManifest,
-    /// The boot manifest contained a key this skeleton does not own.
+    /// The boot manifest contained a key this crate does not own.
     UnknownManifestKey,
     /// A manifest or handoff did not name a kernel image.
     MissingKernelImage,

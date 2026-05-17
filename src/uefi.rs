@@ -15,7 +15,7 @@ pub const UEFI_PAGE_SIZE: u64 = 4096;
 /// Maximum UEFI memory descriptors retained in host-mode tests.
 pub const MAX_UEFI_MEMORY_DESCRIPTORS: usize = 128;
 
-/// UEFI memory type subset used by the boot skeleton.
+/// UEFI memory type subset used by the boot crate.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UefiMemoryType {
@@ -71,9 +71,32 @@ impl UefiMemoryAttributes {
         Self { bits: 0 }
     }
 
+    /// Creates attributes after rejecting unknown bits.
+    pub const fn from_bits(bits: u64) -> BootResult<Self> {
+        if bits & !Self::known_bits() != 0 {
+            Err(BootError::ReservedBits)
+        } else {
+            Ok(Self { bits })
+        }
+    }
+
+    /// All known UEFI attribute bits.
+    pub const fn known_bits() -> u64 {
+        Self::WRITE_BACK.bits | Self::EXECUTE.bits | Self::RUNTIME.bits
+    }
+
     /// Raw attribute bits.
     pub const fn bits(self) -> u64 {
         self.bits
+    }
+
+    /// Validates reserved bits.
+    pub const fn validate(self) -> BootResult<()> {
+        if self.bits & !Self::known_bits() != 0 {
+            Err(BootError::ReservedBits)
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns the union of two attribute sets.
@@ -125,10 +148,14 @@ impl UefiMemoryDescriptor {
         number_of_pages: u64,
         attributes: UefiMemoryAttributes,
     ) -> BootResult<Self> {
+        attributes.validate()?;
         let length = number_of_pages
             .checked_mul(UEFI_PAGE_SIZE)
             .ok_or(BootError::InvalidUefiDescriptor)?;
-        if number_of_pages == 0 || physical_start.checked_add(length).is_none() {
+        if number_of_pages == 0
+            || physical_start.checked_add(length).is_none()
+            || !physical_start.is_multiple_of(UEFI_PAGE_SIZE)
+        {
             return Err(BootError::InvalidUefiDescriptor);
         }
         Ok(Self {
@@ -155,8 +182,23 @@ impl UefiMemoryDescriptor {
         }
     }
 
+    /// Validates descriptor metadata.
+    pub fn validate(self) -> BootResult<()> {
+        if self.reserved != 0
+            || self.number_of_pages == 0
+            || !self.physical_start.is_multiple_of(UEFI_PAGE_SIZE)
+            || (self.virtual_start != 0 && !self.virtual_start.is_multiple_of(UEFI_PAGE_SIZE))
+        {
+            return Err(BootError::InvalidUefiDescriptor);
+        }
+        self.byte_len().ok_or(BootError::InvalidUefiDescriptor)?;
+        self.end().ok_or(BootError::InvalidUefiDescriptor)?;
+        self.attributes.validate()
+    }
+
     /// Converts this descriptor into a kernel handoff memory region.
     pub fn to_handoff_region(self) -> BootResult<HandoffMemoryRegion> {
+        self.validate()?;
         let length = self.byte_len().ok_or(BootError::InvalidUefiDescriptor)?;
         let (kind, attributes) = match self.memory_type {
             UefiMemoryType::Conventional => (
@@ -235,6 +277,7 @@ impl UefiMemoryMap {
 
     /// Adds a descriptor, rejecting overlaps and capacity overflow.
     pub fn push(&mut self, descriptor: UefiMemoryDescriptor) -> BootResult<()> {
+        descriptor.validate()?;
         if self.len == MAX_UEFI_MEMORY_DESCRIPTORS {
             return Err(BootError::CapacityExceeded);
         }
@@ -251,11 +294,28 @@ impl UefiMemoryMap {
         Ok(())
     }
 
+    /// Validates descriptor metadata and overlap constraints.
+    pub fn validate(&self) -> BootResult<()> {
+        for (index, descriptor) in self.descriptors().iter().copied().enumerate() {
+            descriptor.validate()?;
+            let descriptor_end = descriptor.end().ok_or(BootError::InvalidUefiDescriptor)?;
+            for other in self.descriptors().iter().copied().skip(index + 1) {
+                other.validate()?;
+                let other_end = other.end().ok_or(BootError::InvalidUefiDescriptor)?;
+                if descriptor.physical_start < other_end && other.physical_start < descriptor_end {
+                    return Err(BootError::MemoryRegionOverlap);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Converts this map into the kernel handoff memory map.
     pub fn to_handoff_memory_map(&self) -> BootResult<HandoffMemoryMap> {
         if self.is_empty() {
             return Err(BootError::MemoryMapEmpty);
         }
+        self.validate()?;
         let mut map = HandoffMemoryMap::new();
         for descriptor in self.descriptors() {
             map.push(descriptor.to_handoff_region()?)?;

@@ -1,6 +1,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-//! UEFI and emulator boot handoff skeleton for the Alani MVK.
+//! UEFI and emulator boot handoff implementation surface for the Alani MVK.
 //!
 //! The crate stays dependency-free while `alani-abi`, `alani-platform`, and
 //! `alani-config` stabilize. It provides no-std-friendly contracts for boot
@@ -16,10 +16,11 @@ pub mod uefi;
 use early_console::{ConsoleSeverity, EarlyConsole, EarlyConsoleConfig};
 use error::{BootError, BootResult};
 use handoff::{
-    BootHandoff, BootHandoffBuilder, BootSource, BootTarget, CpuFeatureSet, HandoffImage,
-    HandoffImageKind, HandoffMemoryMap, MeasurementRecord,
+    BootHandoff, BootHandoffBuilder, BootOptions, BootSource, BootTarget, CpuFeatureSet,
+    HandoffBootProfile, HandoffImage, HandoffImageKind, HandoffMemoryMap, MeasurementRecord,
+    BOOT_OPTION_ALLOW_MOCKS, BOOT_OPTION_EARLY_CONSOLE, BOOT_OPTION_REQUIRE_SECURE_BOOT,
 };
-use manifest::BootManifest;
+use manifest::{BootManifest, BootProfile};
 use uefi::UefiMemoryMap;
 
 /// Repository name.
@@ -28,13 +29,13 @@ pub const REPOSITORY: &str = "alani-boot";
 /// Crate version.
 pub const VERSION: &str = "0.1.0";
 
-/// Public module names exposed by this skeleton.
+/// Public module names exposed by this crate.
 pub const MODULES: &[&str] = &["early_console", "error", "handoff", "manifest", "uefi"];
 
 /// Implementation maturity marker for generated repository metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComponentStatus {
-    /// API is present as a draft skeleton.
+    /// API is present as a draft interface.
     Draft,
     /// API is implemented enough for host-mode experimentation.
     Experimental,
@@ -233,6 +234,9 @@ pub fn build_handoff_from_manifest(
     if memory_map.is_empty() {
         return Err(BootError::MemoryMapEmpty);
     }
+    if manifest.require_secure_boot && measurement.is_none() {
+        return Err(BootError::IntegrityMismatch);
+    }
 
     let kernel = HandoffImage::new(
         HandoffImageKind::Kernel,
@@ -244,6 +248,7 @@ pub fn build_handoff_from_manifest(
 
     let mut builder = BootHandoffBuilder::new(target, source)
         .kernel_image(kernel)
+        .boot_options(boot_options_from_manifest(manifest)?)
         .cpu_features(cpu_features);
 
     for region in memory_map.entries() {
@@ -285,6 +290,26 @@ pub fn build_handoff_from_manifest(
     }
 
     builder.build()
+}
+
+fn boot_options_from_manifest(manifest: &BootManifest<'_>) -> BootResult<BootOptions> {
+    let profile = match manifest.profile {
+        BootProfile::Minimal => HandoffBootProfile::Minimal,
+        BootProfile::Development => HandoffBootProfile::Development,
+        BootProfile::Recovery => HandoffBootProfile::Recovery,
+        BootProfile::Test => HandoffBootProfile::Test,
+    };
+    let mut flags = 0;
+    if manifest.require_secure_boot {
+        flags |= BOOT_OPTION_REQUIRE_SECURE_BOOT;
+    }
+    if manifest.allow_mocks {
+        flags |= BOOT_OPTION_ALLOW_MOCKS;
+    }
+    if manifest.console.is_some() {
+        flags |= BOOT_OPTION_EARLY_CONSOLE;
+    }
+    BootOptions::new(profile, flags)
 }
 
 /// Builds a validated handoff from a parsed manifest and UEFI memory map.
